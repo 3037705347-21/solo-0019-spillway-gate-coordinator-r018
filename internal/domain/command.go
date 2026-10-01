@@ -130,19 +130,28 @@ func (c *GateCommand) Review(decision InterlockDecision, token string, now time.
 	return nil
 }
 
+// BeginExecution crosses the one-way execution boundary: an approved command
+// with a matching token becomes executing and the token is consumed. Every
+// precondition is checked before the receiver is touched, so a call that fails
+// here has taken no effect and leaves the token usable for a later retry.
 func (c *GateCommand) BeginExecution(token, operator, requestKey string, now time.Time) error {
 	if c.Status != CommandApproved {
 		return Conflict("command_not_executable", "only approved commands can execute")
 	}
-	if strings.TrimSpace(token) == "" || token != c.ExecutionToken {
+	token = strings.TrimSpace(token)
+	if token == "" || token != c.ExecutionToken {
 		return Conflict("invalid_execution_token", "execution token is invalid")
 	}
 	requestKey = strings.TrimSpace(requestKey)
 	if requestKey == "" {
 		return Invalid("invalid_execution_request", "execution request identity is required")
 	}
+	operator = strings.TrimSpace(operator)
+	if operator == "" {
+		return Invalid("invalid_operator", "operator is required")
+	}
 
-	c.ExecutedBy = strings.TrimSpace(operator)
+	c.ExecutedBy = operator
 	c.Status = CommandExecuting
 	c.ExecutionToken = ""
 	c.ExecutionReceipt = &ExecutionReceipt{
@@ -153,9 +162,6 @@ func (c *GateCommand) BeginExecution(token, operator, requestKey string, now tim
 	}
 	c.UpdatedAt = now.UTC()
 	c.Version++
-	if c.ExecutedBy == "" {
-		return Invalid("invalid_operator", "operator is required")
-	}
 	return nil
 }
 
@@ -207,31 +213,20 @@ func (c *GateCommand) Abort(gate Gate, requestKey, reason string, now time.Time)
 	return nil
 }
 
-func (c GateCommand) ReplayExecution(requestKey string) (GateCommand, Gate, bool) {
+// ConfirmExecution handles a retry of an already finished execution request.
+// It never crosses the execution boundary: when requestKey identifies the
+// original settled request it returns the stored terminal command and the gate
+// snapshot captured at completion, with no state mutation. The token itself
+// stays consumed (the command remains terminal); only the result is replayed.
+func (c GateCommand) ConfirmExecution(requestKey string) (GateCommand, Gate, bool) {
 	if c.ExecutionReceipt == nil || c.ExecutionReceipt.RequestKey != requestKey {
 		return GateCommand{}, Gate{}, false
 	}
-	if !c.IsTerminal() {
+	if !c.IsTerminal() || c.ExecutionReceipt.Status != c.Status {
 		return GateCommand{}, Gate{}, false
 	}
 
 	command := c
 	command.ExecutionToken = ""
-	command.UpdatedAt = c.ExecutionReceipt.UpdatedAt
-	command.Version = c.ExecutionReceipt.CommandVersion
 	return command, c.ExecutionReceipt.Gate, true
-}
-
-func (c *GateCommand) RebuildExecutionRequest(token, requestKey string) bool {
-	if c.ExecutionReceipt == nil || c.ExecutionReceipt.RequestKey != requestKey {
-		return false
-	}
-	if !c.IsTerminal() {
-		return false
-	}
-
-	c.Status = CommandApproved
-	c.ExecutionToken = token
-	c.ExecutionReceipt = nil
-	return true
 }

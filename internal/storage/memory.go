@@ -136,19 +136,27 @@ func (m *MemoryRepository) ExecuteCommand(
 		return domain.GateCommand{}, domain.Gate{}, domain.NotFound("gate_not_found", "gate id was not found")
 	}
 
-	nextCommand := cloneCommand(command)
-	replayed := nextCommand.RebuildExecutionRequest(token, requestKey)
-	nextGate := gate
-	beginErr := nextCommand.BeginExecution(token, operator, requestKey, now)
-	m.commands[nextCommand.ID] = nextCommand
-	if beginErr != nil {
-		return domain.GateCommand{}, domain.Gate{}, beginErr
+	// Retry path: a finished execution request is confirmed with its original
+	// terminal state. This never crosses the execution boundary again, performs
+	// no write, and does not bump versions or move the gate.
+	if command.IsTerminal() {
+		if replayed, replayedGate, ok := command.ConfirmExecution(requestKey); ok {
+			return replayed, replayedGate, nil
+		}
+		return domain.GateCommand{}, domain.Gate{}, domain.Conflict(
+			"command_not_executable",
+			"only approved commands can execute",
+		)
 	}
 
-	if replayed {
-		if err := nextGate.Reserve(nextCommand.ID, now); err != nil {
-			return domain.GateCommand{}, domain.Gate{}, err
-		}
+	// First attempt: run the whole approved -> executing -> terminal sequence
+	// and the gate reservation -> movement -> settle sequence on copies. Nothing
+	// is written until every transition succeeds, so a failure before the
+	// execution boundary does not consume the token or change the gate.
+	nextCommand := cloneCommand(command)
+	nextGate := gate
+	if err := nextCommand.BeginExecution(token, operator, requestKey, now); err != nil {
+		return domain.GateCommand{}, domain.Gate{}, err
 	}
 	if err := nextGate.StartMovement(nextCommand.ID, now); err != nil {
 		return domain.GateCommand{}, domain.Gate{}, err
@@ -170,6 +178,9 @@ func (m *MemoryRepository) ExecuteCommand(
 		}
 	}
 
+	// Single atomic commit point: under the repository lock, near-simultaneous
+	// retries cannot interleave here, and another command cannot reserve the
+	// gate while the boundary is being crossed.
 	m.commands[nextCommand.ID] = nextCommand
 	m.gates[nextGate.ID] = nextGate
 	return cloneCommand(nextCommand), nextGate, nil
