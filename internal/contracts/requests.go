@@ -23,5 +23,6 @@ type ReviewInterlockRequest struct {
 type ExecuteCommandRequest struct {
 	Operator      string `json:"operator"`
 	Token         string `json:"token"`
+	RequestID     string `json:"request_id"`
 	SimulateFault bool   `json:"simulate_fault"`
 }

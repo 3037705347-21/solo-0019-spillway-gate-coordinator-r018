@@ -58,6 +58,7 @@ type ReviewCommandResponse struct {
 }
 
 type ExecuteCommandResponse struct {
-	Command CommandView `json:"command"`
-	Gate    GateView    `json:"gate"`
+	Command          CommandView `json:"command"`
+	Gate             GateView    `json:"gate"`
+	IdempotentReplay bool        `json:"idempotent_replay"`
 }

@@ -109,6 +109,9 @@ func (c *GateCommand) Review(decision InterlockDecision, token string, now time.
 	if c.Status != CommandPending {
 		return Conflict("command_not_pending", "only pending commands can be reviewed")
 	}
+	if decision.IsClear() && strings.TrimSpace(token) == "" {
+		return Invalid("missing_execution_token", "clear decisions require an execution token")
+	}
 
 	decisionCopy := decision
 	c.Interlock = &decisionCopy
@@ -116,11 +119,7 @@ func (c *GateCommand) Review(decision InterlockDecision, token string, now time.
 	c.Version++
 
 	if decision.IsClear() {
-		token = strings.TrimSpace(token)
-		if token == "" {
-			return Invalid("missing_execution_token", "clear decisions require an execution token")
-		}
-		c.ExecutionToken = token
+		c.ExecutionToken = strings.TrimSpace(token)
 		c.Status = CommandApproved
 		return nil
 	}
@@ -130,41 +129,77 @@ func (c *GateCommand) Review(decision InterlockDecision, token string, now time.
 	return nil
 }
 
-func (c *GateCommand) BeginExecution(token, operator, requestKey string, now time.Time) error {
-	if c.Status != CommandApproved {
+// ExecuteDenial explains why a command in its current state cannot start an
+// execution. It never changes state.
+func (c GateCommand) ExecuteDenial() error {
+	switch c.Status {
+	case CommandCompleted:
+		return Conflict("command_already_completed", "command already completed; its token cannot start another execution")
+	case CommandAborted:
+		return Conflict("command_already_aborted", "command already aborted; its token cannot start another execution")
+	case CommandRejected:
+		return Conflict("command_rejected", "rejected commands cannot execute")
+	case CommandExecuting:
+		return Conflict("execution_in_progress", "execution is already in progress")
+	default:
 		return Conflict("command_not_executable", "only approved commands can execute")
 	}
-	if strings.TrimSpace(token) == "" || token != c.ExecutionToken {
+}
+
+// BeginExecution crosses the single execution boundary approved->executing.
+// All preconditions are validated against the current state before anything is
+// mutated, so a rejected attempt leaves the command and its token untouched:
+// a request that never took effect must not consume the token.
+func (c *GateCommand) BeginExecution(token, operator, requestKey string, now time.Time) error {
+	token = strings.TrimSpace(token)
+	operator = strings.TrimSpace(operator)
+	requestKey = strings.TrimSpace(requestKey)
+
+	if c.Status != CommandApproved {
+		return c.ExecuteDenial()
+	}
+	if token == "" || token != c.ExecutionToken {
 		return Conflict("invalid_execution_token", "execution token is invalid")
 	}
-	requestKey = strings.TrimSpace(requestKey)
+	if operator == "" {
+		return Invalid("invalid_operator", "operator is required")
+	}
 	if requestKey == "" {
 		return Invalid("invalid_execution_request", "execution request identity is required")
 	}
 
-	c.ExecutedBy = strings.TrimSpace(operator)
+	c.ExecutedBy = operator
 	c.Status = CommandExecuting
+	// The live token authorizes exactly one boundary crossing; erase it the
+	// moment the boundary is crossed so it can never start another movement.
+	originalToken := c.ExecutionToken
 	c.ExecutionToken = ""
 	c.ExecutionReceipt = &ExecutionReceipt{
-		Token:      token,
+		Token:      originalToken,
 		RequestKey: requestKey,
 		Status:     CommandExecuting,
-		ExecutedBy: c.ExecutedBy,
+		ExecutedBy: operator,
 	}
 	c.UpdatedAt = now.UTC()
 	c.Version++
-	if c.ExecutedBy == "" {
-		return Invalid("invalid_operator", "operator is required")
+	return nil
+}
+
+func (c *GateCommand) requireExecuting(requestKey string) error {
+	if c.Status != CommandExecuting {
+		return Conflict("command_not_executing", "command is not executing")
+	}
+	if c.ExecutionReceipt == nil || c.ExecutionReceipt.RequestKey != strings.TrimSpace(requestKey) {
+		return Conflict("execution_request_mismatch", "execution request does not match the running command")
 	}
 	return nil
 }
 
 func (c *GateCommand) Complete(gate Gate, requestKey string, now time.Time) error {
-	if c.Status != CommandExecuting {
-		return Conflict("command_not_executing", "command is not executing")
+	if err := c.requireExecuting(requestKey); err != nil {
+		return err
 	}
 
-	c.ExecutionToken = ""
 	c.Status = CommandCompleted
 	c.UpdatedAt = now.UTC()
 	c.Version++
@@ -181,15 +216,14 @@ func (c *GateCommand) Complete(gate Gate, requestKey string, now time.Time) erro
 }
 
 func (c *GateCommand) Abort(gate Gate, requestKey, reason string, now time.Time) error {
-	if c.Status != CommandExecuting {
-		return Conflict("command_not_executing", "command is not executing")
+	if err := c.requireExecuting(requestKey); err != nil {
+		return err
 	}
 
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		reason = "gate_execution_failed"
 	}
-	c.ExecutionToken = ""
 	c.TerminalReason = reason
 	c.Status = CommandAborted
 	c.UpdatedAt = now.UTC()
@@ -207,31 +241,26 @@ func (c *GateCommand) Abort(gate Gate, requestKey, reason string, now time.Time)
 	return nil
 }
 
-func (c GateCommand) ReplayExecution(requestKey string) (GateCommand, Gate, bool) {
-	if c.ExecutionReceipt == nil || c.ExecutionReceipt.RequestKey != requestKey {
-		return GateCommand{}, Gate{}, false
+// TerminalReceipt confirms the original outcome of a finished execution. It is
+// strictly read-only: the state machine is not rolled back and no movement is
+// started. Confirming a result is a separate concern from starting one.
+//
+// The presented token must be the token that originally crossed the execution
+// boundary, and the request key must identify the same execution request.
+func (c GateCommand) TerminalReceipt(token, requestKey string) (ExecutionReceipt, bool) {
+	token = strings.TrimSpace(token)
+	requestKey = strings.TrimSpace(requestKey)
+	if c.ExecutionReceipt == nil {
+		return ExecutionReceipt{}, false
 	}
 	if !c.IsTerminal() {
-		return GateCommand{}, Gate{}, false
+		return ExecutionReceipt{}, false
 	}
-
-	command := c
-	command.ExecutionToken = ""
-	command.UpdatedAt = c.ExecutionReceipt.UpdatedAt
-	command.Version = c.ExecutionReceipt.CommandVersion
-	return command, c.ExecutionReceipt.Gate, true
-}
-
-func (c *GateCommand) RebuildExecutionRequest(token, requestKey string) bool {
-	if c.ExecutionReceipt == nil || c.ExecutionReceipt.RequestKey != requestKey {
-		return false
+	if token == "" || token != c.ExecutionReceipt.Token {
+		return ExecutionReceipt{}, false
 	}
-	if !c.IsTerminal() {
-		return false
+	if requestKey == "" || requestKey != c.ExecutionReceipt.RequestKey {
+		return ExecutionReceipt{}, false
 	}
-
-	c.Status = CommandApproved
-	c.ExecutionToken = token
-	c.ExecutionReceipt = nil
-	return true
+	return *c.ExecutionReceipt, true
 }

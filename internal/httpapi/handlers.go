@@ -95,7 +95,7 @@ func (h *handler) executeCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	command, gate, err := h.service.ExecuteCommand(r.Context(), r.PathValue("id"), request)
+	command, gate, replayed, err := h.service.ExecuteCommand(r.Context(), r.PathValue("id"), request)
 	if err != nil {
 		writeDomainError(w, err)
 		return
@@ -104,8 +104,9 @@ func (h *handler) executeCommand(w http.ResponseWriter, r *http.Request) {
 		w,
 		http.StatusOK,
 		contracts.ExecuteCommandResponse{
-			Command: commandView(command, false),
-			Gate:    gateView(gate),
+			Command:          commandView(command, false),
+			Gate:             gateView(gate),
+			IdempotentReplay: replayed,
 		},
 	)
 }

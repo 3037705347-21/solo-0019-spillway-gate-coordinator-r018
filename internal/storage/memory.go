@@ -123,56 +123,63 @@ func (m *MemoryRepository) ExecuteCommand(
 	simulateFault bool,
 	requestKey string,
 	now time.Time,
-) (domain.GateCommand, domain.Gate, error) {
+) (domain.GateCommand, domain.Gate, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// The repository-wide lock is the gate: all command and gate mutations are
+	// serialized. Of two near-simultaneous retries, one crosses the execution
+	// boundary and the other confirms the stored result; commands for other
+	// gates cannot preempt the critical section either.
 	command, exists := m.commands[commandID]
 	if !exists {
-		return domain.GateCommand{}, domain.Gate{}, domain.NotFound("command_not_found", "command id was not found")
+		return domain.GateCommand{}, domain.Gate{}, false, domain.NotFound("command_not_found", "command id was not found")
 	}
 	gate, exists := m.gates[command.GateID]
 	if !exists {
-		return domain.GateCommand{}, domain.Gate{}, domain.NotFound("gate_not_found", "gate id was not found")
+		return domain.GateCommand{}, domain.Gate{}, false, domain.NotFound("gate_not_found", "gate id was not found")
 	}
 
+	// Confirming a previous result never starts a movement: return the stored
+	// terminal state, verbatim, without touching command or gate.
+	if receipt, ok := command.TerminalReceipt(token, requestKey); ok {
+		return cloneCommand(command), receipt.Gate, true, nil
+	}
+
+	// Every precondition is validated below on a copy. Nothing is written on a
+	// rejected attempt, so a request that never took effect cannot consume the
+	// token or change the gate reservation.
 	nextCommand := cloneCommand(command)
-	replayed := nextCommand.RebuildExecutionRequest(token, requestKey)
 	nextGate := gate
-	beginErr := nextCommand.BeginExecution(token, operator, requestKey, now)
-	m.commands[nextCommand.ID] = nextCommand
-	if beginErr != nil {
-		return domain.GateCommand{}, domain.Gate{}, beginErr
-	}
 
-	if replayed {
-		if err := nextGate.Reserve(nextCommand.ID, now); err != nil {
-			return domain.GateCommand{}, domain.Gate{}, err
-		}
+	if err := nextCommand.BeginExecution(token, operator, requestKey, now); err != nil {
+		return domain.GateCommand{}, domain.Gate{}, false, err
 	}
 	if err := nextGate.StartMovement(nextCommand.ID, now); err != nil {
-		return domain.GateCommand{}, domain.Gate{}, err
+		return domain.GateCommand{}, domain.Gate{}, false, err
 	}
 
 	if simulateFault {
 		if err := nextGate.Settle(nextCommand.TargetAperture, true, now); err != nil {
-			return domain.GateCommand{}, domain.Gate{}, err
+			return domain.GateCommand{}, domain.Gate{}, false, err
 		}
 		if err := nextCommand.Abort(nextGate, requestKey, "simulated_gate_fault", now); err != nil {
-			return domain.GateCommand{}, domain.Gate{}, err
+			return domain.GateCommand{}, domain.Gate{}, false, err
 		}
 	} else {
 		if err := nextGate.Settle(nextCommand.TargetAperture, false, now); err != nil {
-			return domain.GateCommand{}, domain.Gate{}, err
+			return domain.GateCommand{}, domain.Gate{}, false, err
 		}
 		if err := nextCommand.Complete(nextGate, requestKey, now); err != nil {
-			return domain.GateCommand{}, domain.Gate{}, err
+			return domain.GateCommand{}, domain.Gate{}, false, err
 		}
 	}
 
+	// Commit the command transition and gate transition together, only after
+	// the whole critical section succeeded.
 	m.commands[nextCommand.ID] = nextCommand
 	m.gates[nextGate.ID] = nextGate
-	return cloneCommand(nextCommand), nextGate, nil
+	return cloneCommand(nextCommand), nextGate, false, nil
 }
 
 func cloneCommand(command domain.GateCommand) domain.GateCommand {

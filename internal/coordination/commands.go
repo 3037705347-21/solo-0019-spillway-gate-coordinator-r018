@@ -80,32 +80,37 @@ func (s *Service) ExecuteCommand(
 	ctx context.Context,
 	commandID string,
 	request contracts.ExecuteCommandRequest,
-) (domain.GateCommand, domain.Gate, error) {
-	requestKey, err := executionRequestKey(commandID, request.Token)
+) (domain.GateCommand, domain.Gate, bool, error) {
+	requestKey, err := executionRequestKey(commandID, request.RequestID)
 	if err != nil {
-		return domain.GateCommand{}, domain.Gate{}, err
+		return domain.GateCommand{}, domain.Gate{}, false, err
 	}
-	return s.repository.ExecuteCommand(
+	command, gate, replayed, err := s.repository.ExecuteCommand(
 		ctx,
 		commandID,
-		request.Token,
+		strings.TrimSpace(request.Token),
 		request.Operator,
 		request.SimulateFault,
 		requestKey,
 		s.now(),
 	)
+	return command, gate, replayed, err
 }
 
-func executionRequestKey(commandID, token string) (string, error) {
+// executionRequestKey identifies one operator action (an execution request and
+// its retries after a lost response). It is deliberately independent of the
+// execution token: the token authorizes a single boundary crossing, while the
+// request identity confirms whether a later call is the same action.
+func executionRequestKey(commandID, requestID string) (string, error) {
 	commandID = strings.TrimSpace(commandID)
-	token = strings.TrimSpace(token)
+	requestID = strings.TrimSpace(requestID)
 	if commandID == "" {
 		return "", domain.Invalid("invalid_command_reference", "command id is required")
 	}
-	if token == "" {
-		return "", domain.Conflict("invalid_execution_token", "execution token is invalid")
+	if requestID == "" {
+		return "", domain.Invalid("invalid_execution_request", "request_id is required for execution and its retries")
 	}
 
-	digest := sha256.Sum256([]byte(commandID + "\x00" + token))
+	digest := sha256.Sum256([]byte(commandID + "\x00" + requestID))
 	return base64.RawURLEncoding.EncodeToString(digest[:18]), nil
 }

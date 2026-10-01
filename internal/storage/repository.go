@@ -27,5 +27,5 @@ type Repository interface {
 		simulateFault bool,
 		requestKey string,
 		now time.Time,
-	) (domain.GateCommand, domain.Gate, error)
+	) (command domain.GateCommand, gate domain.Gate, idempotentReplay bool, err error)
 }

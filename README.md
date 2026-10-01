@@ -60,9 +60,18 @@ POST /commands/{id}/execute
 {
   "operator": "operator-chen",
   "token": "复核响应中的 execution_token",
+  "request_id": "操作员为本次动作生成的唯一标识，重试保持不变",
   "simulate_fault": false
 }
 ```
+
+### 令牌一次性与同请求重试
+
+- `token` 只授权一次执行边界跨越（approved → executing）。边界跨越的一刻令牌即作废，命令结束后不能用它再次启动任何移动。
+- `request_id` 标识操作员的同一次动作。响应丢失后，操作员用**相同的 `request_id` 和相同的 `token`** 重试，服务不会重新执行，而是返回原终态（命令、闸门快照原样），响应中 `idempotent_replay` 为 `true`。
+- 未生效的失败（空操作员、令牌不匹配、缺少 `request_id` 等）不消耗令牌：修正后可用同一 `request_id` 正常执行。
+- 不同的 `request_id` 复用已结束命令的旧令牌，会被当作一次新动作拒绝（409 `command_already_completed` / `command_already_aborted`）。
+- 同一请求近乎同时到达的多个重试，只有一个跨越执行边界，其余全部确认同一终态。
 
 ## 目录
 
